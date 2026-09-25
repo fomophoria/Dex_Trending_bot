@@ -1,470 +1,442 @@
-﻿// research_worker.js
+// research_worker.js
 
 const { chromium } = require('playwright-extra');
-
-const stealth =
-    require('puppeteer-extra-plugin-stealth')();
-
-const config =
-    require('./config');
-
-const IdentityFactory =
-    require('./identity_factory');
-
+const stealth = require('puppeteer-extra-plugin-stealth')();
+const config = require('./config');
+const IdentityFactory = require('./identity_factory');
+const ProxyManager = require('./proxy_manager');
 
 chromium.use(stealth);
 
-
 class ResearchWorker {
-
     constructor(sessionId) {
+        this.sessionId = sessionId;
+        this.identity = IdentityFactory.generate();
 
-        this.sessionId =
-            sessionId;
-
-        this.identity =
-            IdentityFactory.generate();
-
-
-        if (
-            Array.isArray(config.PROXY_LIST) &&
-            config.PROXY_LIST.length > 0
-        ) {
-
-            this.proxy =
-                config.PROXY_LIST[
-                    (sessionId - 1) %
-                    config.PROXY_LIST.length
-                ];
-
-        } else {
-
-            this.proxy = null;
-        }
+        /*
+         * Proxy is retrieved asynchronously when the worker starts.
+         */
+        this.proxy = null;
     }
 
-
-    /*
-    ================================================================
-    START
-    ================================================================
-    */
-
     async start() {
-
-        console.log('');
-
-        console.log(
-            `[Worker ${this.sessionId}] Initialising identity...`
-        );
-
-        console.log(
-            `[Worker ${this.sessionId}] UA: ` +
-            this.identity.userAgent
-        );
-
+        console.log(`\n[Worker ${this.sessionId}] Initializing identity...`);
+        console.log(`[Worker ${this.sessionId}] UA: ${this.identity.userAgent}`);
         console.log(
             `[Worker ${this.sessionId}] Viewport: ` +
-            `${this.identity.viewport.width}x` +
-            `${this.identity.viewport.height}`
+            `${this.identity.viewport.width}x${this.identity.viewport.height}`
+        );
+        console.log(`[Worker ${this.sessionId}] Timezone: ${this.identity.timezone}`);
+        console.log(`[Worker ${this.sessionId}] Locale: ${this.identity.locale}`);
+        console.log(`[Worker ${this.sessionId}] Platform: ${this.identity.platform}`);
+        console.log(
+            `[Worker ${this.sessionId}] Hardware Concurrency: ` +
+            `${this.identity.hardwareConcurrency}`
         );
 
         console.log(
-            `[Worker ${this.sessionId}] Timezone: ` +
-            this.identity.timezone
+            `[Worker ${this.sessionId}] Requesting ASocks proxy...`
         );
+
+        this.proxy =
+            await ProxyManager.getProxyConfig(
+                this.sessionId
+            );
 
         console.log(
-            `[Worker ${this.sessionId}] Locale: ` +
-            this.identity.locale
+            `[Worker ${this.sessionId}] ASocks proxy acquired successfully`
         );
-
 
         const launchArgs = [
             '--disable-blink-features=AutomationControlled',
             '--no-sandbox',
-            '--disable-setuid-sandbox'
+            '--disable-setuid-sandbox',
+            '--disable-web-security', // Helps bypass cross-origin iframe issues
+            '--disable-features=IsolateOrigins,site-per-process' // Critical for Cloudflare iframe interaction
         ];
 
+        const launchOptions = {
+            headless: !config.DEBUG_MODE,
+            args: launchArgs,
+            slowMo: config.DEBUG_MODE ? 35 : 0
+        };
 
         if (this.proxy) {
-
             console.log(
-                `[Worker ${this.sessionId}] Proxy configured`
+                `[Worker ${this.sessionId}] Proxy: ` +
+                `${this.proxy.region.toUpperCase()} via ${this.proxy.server}`
             );
 
-            launchArgs.push(
-                `--proxy-server=${this.proxy}`
+            launchOptions.proxy = {
+                server: this.proxy.server,
+                username: this.proxy.username,
+                password: this.proxy.password
+            };
+        } else {
+            console.log(
+                `[Worker ${this.sessionId}] No proxy configured - using local IP`
             );
         }
 
+        const browser = await chromium.launch(
+            launchOptions
+        );
 
-        const browser =
-            await chromium.launch({
+        const context = await browser.newContext({
+            userAgent: this.identity.userAgent,
+            viewport: this.identity.viewport,
+            timezoneId: this.identity.timezone,
+            locale: this.identity.locale,
 
-                headless:
-                    !config.DEBUG_MODE,
+            extraHTTPHeaders: {
+                'sec-ch-ua-platform': `${this.identity.platform}`
+            },
 
-                args:
-                    launchArgs,
+            deviceScaleFactor: this.identity.deviceScaleFactor,
+            permissions: ['geolocation']
+        });
 
-                slowMo:
-                    config.DEBUG_MODE
-                        ? 35
-                        : 0
-            });
+        await context.addInitScript(() => {
+            Object.defineProperty(
+                navigator,
+                'webdriver',
+                {
+                    get: () => undefined
+                }
+            );
 
+            window.chrome = { runtime: {} };
 
-        const context =
-            await browser.newContext({
+            const toBlob =
+                HTMLCanvasElement.prototype.toBlob;
 
-                userAgent:
-                    this.identity.userAgent,
+            HTMLCanvasElement.prototype.toBlob =
+                function(...args) {
+                    const ctx =
+                        this.getContext('2d');
 
-                viewport:
-                    this.identity.viewport,
+                    ctx.fillStyle =
+                        'rgba(0,0,0,0.01)';
 
-                timezoneId:
-                    this.identity.timezone,
+                    ctx.fillRect(
+                        0,
+                        0,
+                        1,
+                        1
+                    );
 
-                locale:
-                    this.identity.locale
-            });
-
+                    return toBlob.apply(
+                        this,
+                        args
+                    );
+                };
+        });
 
         const page =
             await context.newPage();
 
-
-        page.setDefaultTimeout(
-            10000
-        );
-
+        page.setDefaultTimeout(10000);
 
         page.setDefaultNavigationTimeout(
             config.NAVIGATION_TIMEOUT_MS
         );
 
+        // --- DATA SAVER LOGIC ---
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['image', 'font', 'media'].includes(type)) {
+                route.abort();
+            } else {
+                route.continue();
+            }
+        });
 
         try {
+            await this.loadDexScreener(page);
 
-            /*
-            ========================================================
-            LOAD DEX SCREENER
-            ========================================================
-            */
+            // --- CLOUDFLARE AUTO-SOLVE SECTION ---
+            await this.handleCloudflare(page);
 
-            const referrer =
-                this.randomFrom(
-                    config.REFERRERS
-                );
+            await this.interactionLoop(page);
 
-
-            console.log('');
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Opening DEX Screener...`
-            );
-
-
-            await page.goto(
-                config.TARGET_URL,
-                {
-                    waitUntil:
-                        'domcontentloaded',
-
-                    timeout:
-                        config.NAVIGATION_TIMEOUT_MS,
-
-                    referer:
-                        referrer
-                }
-            );
-
-
-            console.log(
-                `[Worker ${this.sessionId}] DOM loaded`
-            );
-
-
-            await this.sleep(
-                config.INITIAL_LOAD_WAIT_MS
-            );
-
-
-            await page.bringToFront();
-
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Page title: ${await page.title()}`
-            );
-
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Current URL: ${page.url()}`
-            );
-
-
-            /*
-            ========================================================
-            INTERACTION LOOP
-            ========================================================
-            */
-
-            console.log('');
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `=========================================`
-            );
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `STARTING INTERACTION LOOP`
-            );
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `=========================================`
-            );
-
-
-            for (
-                let cycle = 1;
-                cycle <= config.INTERACTION_CYCLES;
-                cycle++
-            ) {
-
-                console.log('');
-
-                console.log(
-                    `[Worker ${this.sessionId}] ` +
-                    `--- Cycle ${cycle}/` +
-                    `${config.INTERACTION_CYCLES} ---`
-                );
-
-
-                /*
-                 * 1. General mouse movement.
-                 */
-
-                await this.moveMouse(
-                    page
-                );
-
-
-                await this.randomPause();
-
-
-                /*
-                 * 2. Interact with chart.
-                 */
-
-                await this.interactWithChart(
-                    page,
-                    cycle
-                );
-
-
-                await this.randomPause();
-
-
-                /*
-                 * 3. Scroll one of DEX Screener's internal panels.
-                 */
-
-                const distance =
-                    this.randomBetween(
-
-                        config
-                            .SCROLL_DISTANCE_RANGE[0],
-
-                        config
-                            .SCROLL_DISTANCE_RANGE[1]
-                    );
-
-
-                const direction =
-                    cycle ===
-                    config.INTERACTION_CYCLES
-
-                        ? -1
-                        : 1;
-
-
-                await this.scrollPage(
-                    page,
-                    distance * direction
-                );
-
-
-                await this.randomPause();
-
-
-                /*
-                 * 4. Table controls.
-                 */
-
-                await this.performSafeClick(
-                    page,
-                    cycle
-                );
-
-
-                await this.randomPause();
-            }
-
-
-            /*
-            ========================================================
-            FINAL WAIT
-            ========================================================
-            */
-
-            const dwell =
-                this.randomBetween(
-
-                    config.DWELL_TIME_RANGE[0],
-
-                    config.DWELL_TIME_RANGE[1]
-                );
-
-
-            console.log('');
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Interaction loop completed.`
-            );
-
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Keeping browser open for ${dwell}s`
-            );
-
-
-            await this.sleep(
-                dwell * 1000
-            );
-
-
-            console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Session completed successfully.`
-            );
-
+            await this.finalDwell(page);
 
         } catch (error) {
 
-            console.error('');
-
             console.error(
-                `[Worker ${this.sessionId}] ERROR:`
-            );
-
-            console.error(
+                `\n[Worker ${this.sessionId}] ERROR:`,
                 error
             );
 
+            /*
+             * Only attempt a screenshot if the page
+             * still exists.
+             *
+             * This prevents the screenshot operation
+             * from throwing another error if Chromium
+             * or the page has already closed.
+             */
 
-            try {
+            if (!page.isClosed()) {
+                try {
+                    await page.screenshot({
+                        path: `error-worker-${this.sessionId}.png`,
+                        fullPage: false
+                    });
 
-                const filename =
-                    `error-worker-${this.sessionId}.png`;
+                    console.log(
+                        `[Worker ${this.sessionId}] Error screenshot saved`
+                    );
 
+                } catch (screenshotError) {
 
-                await page.screenshot({
-                    path:
-                        filename,
-
-                    fullPage:
-                        false
-                });
-
-
+                    console.log(
+                        `[Worker ${this.sessionId}] Could not save error screenshot: ` +
+                        `${screenshotError.message}`
+                    );
+                }
+            } else {
                 console.log(
-                    `[Worker ${this.sessionId}] ` +
-                    `Error screenshot saved: ${filename}`
-                );
-
-
-            } catch (screenshotError) {
-
-                console.error(
-                    `[Worker ${this.sessionId}] ` +
-                    `Could not save screenshot`
+                    `[Worker ${this.sessionId}] Page already closed - skipping error screenshot`
                 );
             }
-
 
         } finally {
 
             console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Closing browser...`
+                `[Worker ${this.sessionId}] Closing browser...`
             );
 
-
-            await browser.close();
-
+            try {
+                await browser.close();
+            } catch (error) {
+                console.log(
+                    `[Worker ${this.sessionId}] Browser was already closed`
+                );
+            }
 
             console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Browser closed.`
+                `[Worker ${this.sessionId}] Browser closed.`
             );
         }
     }
 
+    /**
+     * Detects and solves Cloudflare Turnstile automatically
+     */
+    async handleCloudflare(page) {
+        console.log(`[Worker ${this.sessionId}] Checking for Cloudflare challenges...`);
 
-    /*
-    ================================================================
-    GENERAL MOUSE MOVEMENT
-    ================================================================
-    */
+        // Wait for potential challenge to appear
+        await this.sleep(5000);
+
+        const cloudflareSelectors = [
+            'iframe[src*="cloudflare"]',
+            '#cf-turnstile-wrapper',
+            '.cf-browser-verification',
+            '#challenge-form'
+        ];
+
+        let challengeFound = false;
+        for (const selector of cloudflareSelectors) {
+            if (await page.locator(selector).count() > 0) {
+                challengeFound = true;
+                break;
+            }
+        }
+
+        if (challengeFound) {
+            console.log(`[Worker ${this.sessionId}] Cloudflare challenge detected. Attempting solve...`);
+
+            try {
+                // Find the Turnstile checkbox iframe
+                const frame = page.frames().find(f =>
+                    f.url().includes('turnstile') || f.url().includes('cloudflare')
+                );
+
+                if (frame) {
+                    // We don't click the selector directly (which is easily detected)
+                    // Instead, we find the coordinates and perform a human-like click
+                    const box = await page.locator('iframe[src*="cloudflare"]').boundingBox();
+                    if (box) {
+                        const clickX = box.x + (box.width / 2) + (Math.random() * 10 - 5);
+                        const clickY = box.y + (box.height / 2) + (Math.random() * 10 - 5);
+
+                        await page.mouse.move(clickX, clickY, { steps: 15 });
+                        await page.mouse.down();
+                        await this.sleep(this.randomBetween(100, 250));
+                        await page.mouse.up();
+
+                        console.log(`[Worker ${this.sessionId}] Bypassed Cloudflare checkbox.`);
+                    }
+                }
+            } catch (e) {
+                console.log(`[Worker ${this.sessionId}] Automated solve failed, waiting for auto-clear...`);
+            }
+
+            // Wait for the page to actually load after solve
+            await page.waitForSelector('canvas', { timeout: 30000 }).catch(() => {
+                console.log(`[Worker ${this.sessionId}] Page did not load canvas after solve.`);
+            });
+        } else {
+            console.log(`[Worker ${this.sessionId}] No Cloudflare challenge visible.`);
+        }
+    }
+
+    async loadDexScreener(page) {
+        const referrer =
+            this.randomFrom(
+                config.REFERRERS
+            );
+
+        console.log(
+            `\n[Worker ${this.sessionId}] Opening DEX Screener with referrer: ${referrer}`
+        );
+
+        await page.goto(
+            config.TARGET_URL,
+            {
+                waitUntil: 'domcontentloaded',
+                timeout:
+                    config.NAVIGATION_TIMEOUT_MS,
+                referer: referrer
+            }
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] DOM loaded`
+        );
+
+        await this.sleep(
+            config.INITIAL_LOAD_WAIT_MS
+        );
+
+        await page.bringToFront();
+
+        console.log(
+            `[Worker ${this.sessionId}] Page title: ${await page.title()}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Current URL: ${page.url()}`
+        );
+    }
+
+    async interactionLoop(page) {
+        console.log(
+            `\n[Worker ${this.sessionId}] =========================================`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] STARTING INTERACTION LOOP`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] =========================================`
+        );
+
+        for (
+            let cycle = 1;
+            cycle <= config.INTERACTION_CYCLES;
+            cycle++
+        ) {
+            console.log(
+                `\n[Worker ${this.sessionId}] --- Cycle ${cycle}/${config.INTERACTION_CYCLES} ---`
+            );
+
+            await this.moveMouse(page);
+
+            await this.randomPause();
+
+            await this.interactWithChart(
+                page,
+                cycle
+            );
+
+            await this.randomPause();
+
+            const distance =
+                this.randomBetween(
+                    config.SCROLL_DISTANCE_RANGE[0],
+                    config.SCROLL_DISTANCE_RANGE[1]
+                );
+
+            const direction =
+                cycle ===
+                config.INTERACTION_CYCLES
+                    ? -1
+                    : 1;
+
+            await this.scrollPage(
+                page,
+                distance * direction
+            );
+
+            await this.randomPause();
+
+            await this.performSafeClick(
+                page,
+                cycle
+            );
+
+            await this.randomPause();
+        }
+    }
+
+    async finalDwell(page) {
+        const dwell =
+            this.randomBetween(
+                config.DWELL_TIME_RANGE[0],
+                config.DWELL_TIME_RANGE[1]
+            );
+
+        console.log(
+            `\n[Worker ${this.sessionId}] Interaction loop completed.`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Keeping browser open for ${dwell}s`
+        );
+
+        await this.sleep(
+            dwell * 1000
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Session completed successfully.`
+        );
+    }
 
     async moveMouse(page) {
-
         const width =
             this.identity.viewport.width;
 
         const height =
             this.identity.viewport.height;
 
-
         const x =
             this.randomBetween(
-
                 Math.floor(
                     width * 0.20
                 ),
-
                 Math.floor(
                     width * 0.75
                 )
             );
 
-
         const y =
             this.randomBetween(
-
                 Math.floor(
                     height * 0.15
                 ),
-
                 Math.floor(
                     height * 0.75
                 )
             );
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Moving mouse -> ${x}, ${y}`
+            `[Worker ${this.sessionId}] Moving mouse -> ${x}, ${y}`
         );
-
 
         await page.mouse.move(
             x,
@@ -478,63 +450,35 @@ class ResearchWorker {
             }
         );
 
-
         console.log(
             `[Worker ${this.sessionId}] Mouse moved`
         );
     }
 
-
-    /*
-    ================================================================
-    CHART INTERACTION
-    ================================================================
-    */
-
     async interactWithChart(
         page,
         cycle
     ) {
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Locating chart...`
+            `[Worker ${this.sessionId}] Locating chart...`
         );
 
-
         const chartBox =
-            await this.findChartBox(
-                page
-            );
-
+            await this.findChartBox(page);
 
         if (!chartBox) {
-
             console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Could not locate chart`
+                `[Worker ${this.sessionId}] Could not locate chart`
             );
 
             return false;
         }
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Chart area: ` +
-            `${Math.round(chartBox.width)}x` +
-            `${Math.round(chartBox.height)} ` +
-            `at ` +
-            `${Math.round(chartBox.x)},` +
-            `${Math.round(chartBox.y)}`
+            `[Worker ${this.sessionId}] Chart area: ` +
+            `${Math.round(chartBox.width)}x${Math.round(chartBox.height)} ` +
+            `at ${Math.round(chartBox.x)},${Math.round(chartBox.y)}`
         );
-
-
-        /*
-        ------------------------------------------------------------
-        CLICK INSIDE CHART
-        ------------------------------------------------------------
-        */
 
         const chartX =
             chartBox.x +
@@ -543,10 +487,8 @@ class ResearchWorker {
                 this.randomBetween(
                     30,
                     75
-                ) /
-                100
+                ) / 100
             );
-
 
         const chartY =
             chartBox.y +
@@ -555,10 +497,8 @@ class ResearchWorker {
                 this.randomBetween(
                     30,
                     70
-                ) /
-                100
+                ) / 100
             );
-
 
         await page.mouse.move(
             chartX,
@@ -572,7 +512,6 @@ class ResearchWorker {
             }
         );
 
-
         await this.sleep(
             this.randomBetween(
                 300,
@@ -580,20 +519,15 @@ class ResearchWorker {
             )
         );
 
-
         await page.mouse.click(
             chartX,
             chartY
         );
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Clicked chart at ` +
-            `${Math.round(chartX)},` +
-            `${Math.round(chartY)}`
+            `[Worker ${this.sessionId}] Clicked chart at ` +
+            `${Math.round(chartX)},${Math.round(chartY)}`
         );
-
 
         await this.sleep(
             this.randomBetween(
@@ -602,18 +536,10 @@ class ResearchWorker {
             )
         );
 
-
-        /*
-        ------------------------------------------------------------
-        ZOOM CHART OUT
-        ------------------------------------------------------------
-        */
-
         await this.zoomChartOut(
             page,
             chartBox
         );
-
 
         await this.sleep(
             this.randomBetween(
@@ -622,39 +548,16 @@ class ResearchWorker {
             )
         );
 
-
-        /*
-        ------------------------------------------------------------
-        CHANGE TIMEFRAME
-        ------------------------------------------------------------
-        */
-
         await this.changeChartTimeframe(
             page,
             cycle,
             chartBox
         );
 
-
         return true;
     }
 
-
-    /*
-    ================================================================
-    FIND CHART
-    ================================================================
-
-    DEX Screener / TradingView uses large canvas elements.
-
-    We find visible canvas elements and select the largest one in
-    the main page area.
-
-    If no suitable canvas is found, a viewport-based fallback is used.
-    */
-
     async findChartBox(page) {
-
         const result =
             await page.evaluate(() => {
 
@@ -665,59 +568,39 @@ class ResearchWorker {
                         )
                     );
 
-
                 const viewportWidth =
                     window.innerWidth;
 
                 const viewportHeight =
                     window.innerHeight;
 
-
-                const candidates =
-                    [];
-
+                const candidates = [];
 
                 for (
-                    const canvas of canvases
+                    const canvas
+                    of canvases
                 ) {
-
                     const rect =
-                        canvas
-                            .getBoundingClientRect();
-
+                        canvas.getBoundingClientRect();
 
                     const style =
-                        window
-                            .getComputedStyle(
-                                canvas
-                            );
-
+                        window.getComputedStyle(
+                            canvas
+                        );
 
                     if (
                         style.display === 'none' ||
                         style.visibility === 'hidden'
                     ) {
-
                         continue;
                     }
-
-
-                    /*
-                     * Ignore small canvases.
-                     */
 
                     if (
                         rect.width < 450 ||
                         rect.height < 200
                     ) {
-
                         continue;
                     }
-
-
-                    /*
-                     * Ignore canvases mostly outside the screen.
-                     */
 
                     if (
                         rect.right <= 0 ||
@@ -725,45 +608,27 @@ class ResearchWorker {
                         rect.left >= viewportWidth ||
                         rect.top >= viewportHeight
                     ) {
-
                         continue;
                     }
-
-
-                    /*
-                     * Main chart should not live in the far-right
-                     * token information panel.
-                     */
 
                     if (
                         rect.left >
-                        viewportWidth * 0.80
+                        viewportWidth *
+                        0.80
                     ) {
-
                         continue;
                     }
 
-
                     candidates.push({
-
-                        x:
-                            rect.x,
-
-                        y:
-                            rect.y,
-
-                        width:
-                            rect.width,
-
-                        height:
-                            rect.height,
-
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
                         area:
                             rect.width *
                             rect.height
                     });
                 }
-
 
                 candidates.sort(
                     (a, b) =>
@@ -771,24 +636,13 @@ class ResearchWorker {
                         a.area
                 );
 
-
                 if (
                     candidates.length > 0
                 ) {
-
                     return candidates[0];
                 }
 
-
-                /*
-                 * Fallback based on DEX Screener layout.
-                 *
-                 * Left navigation is approximately 10%.
-                 * Right information panel approximately 25%.
-                 */
-
                 return {
-
                     x:
                         viewportWidth *
                         0.12,
@@ -812,33 +666,22 @@ class ResearchWorker {
                 };
             });
 
-
         return result;
     }
-
-
-    /*
-    ================================================================
-    ZOOM CHART OUT
-    ================================================================
-    */
 
     async zoomChartOut(
         page,
         chartBox
     ) {
-
         const x =
             chartBox.x +
             chartBox.width *
             0.55;
 
-
         const y =
             chartBox.y +
             chartBox.height *
             0.55;
-
 
         await page.mouse.move(
             x,
@@ -848,36 +691,25 @@ class ResearchWorker {
             }
         );
 
-
         const steps =
             this.randomBetween(
-
-                config
-                    .CHART_ZOOM_OUT_STEPS[0],
-
-                config
-                    .CHART_ZOOM_OUT_STEPS[1]
+                config.CHART_ZOOM_OUT_STEPS[0],
+                config.CHART_ZOOM_OUT_STEPS[1]
             );
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Zooming chart out ` +
-            `(${steps} wheel steps)`
+            `[Worker ${this.sessionId}] Zooming chart out (${steps} wheel steps)`
         );
-
 
         for (
             let i = 0;
             i < steps;
             i++
         ) {
-
             await page.mouse.wheel(
                 0,
                 config.CHART_ZOOM_DELTA
             );
-
 
             await this.sleep(
                 this.randomBetween(
@@ -887,29 +719,18 @@ class ResearchWorker {
             );
         }
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Chart zoom action complete`
+            `[Worker ${this.sessionId}] Chart zoom action complete`
         );
     }
-
-
-    /*
-    ================================================================
-    CHANGE CHART TIMEFRAME
-    ================================================================
-    */
 
     async changeChartTimeframe(
         page,
         cycle,
         chartBox
     ) {
-
         const timeframes =
             config.CHART_TIMEFRAMES;
-
 
         const timeframe =
             timeframes[
@@ -917,20 +738,11 @@ class ResearchWorker {
                 timeframes.length
             ];
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Looking for chart timeframe "${timeframe}"`
+            `[Worker ${this.sessionId}] Looking for chart timeframe "${timeframe}"`
         );
 
-
         try {
-
-            /*
-             * Generic text locator because DEX Screener's timeframe
-             * controls aren't guaranteed to use <button>.
-             */
-
             const locator =
                 page.getByText(
                     timeframe,
@@ -939,20 +751,16 @@ class ResearchWorker {
                     }
                 );
 
-
             const count =
                 await locator.count();
-
 
             for (
                 let i = 0;
                 i < count;
                 i++
             ) {
-
                 const item =
                     locator.nth(i);
-
 
                 const visible =
                     await item
@@ -961,11 +769,9 @@ class ResearchWorker {
                             () => false
                         );
 
-
                 if (!visible) {
                     continue;
                 }
-
 
                 const box =
                     await item
@@ -974,52 +780,36 @@ class ResearchWorker {
                             () => null
                         );
 
-
                 if (!box) {
                     continue;
                 }
 
-
-                /*
-                 * The timeframe toolbar sits above the chart.
-                 *
-                 * Only accept small controls near the top of the
-                 * chart so we don't accidentally click unrelated text.
-                 */
-
                 const insideChartWidth =
                     box.x >=
-                    chartBox.x - 100 &&
-
+                    chartBox.x -
+                    100 &&
                     box.x <=
                     chartBox.x +
                     chartBox.width;
 
-
                 const nearChartTop =
                     box.y <
-                    chartBox.y + 100;
-
+                    chartBox.y +
+                    100;
 
                 const reasonableSize =
-                    box.width <
-                    100 &&
-                    box.height <
-                    60;
-
+                    box.width < 100 &&
+                    box.height < 60;
 
                 if (
                     !insideChartWidth ||
                     !nearChartTop ||
                     !reasonableSize
                 ) {
-
                     continue;
                 }
 
-
                 await item.hover();
-
 
                 await this.sleep(
                     this.randomBetween(
@@ -1028,67 +818,43 @@ class ResearchWorker {
                     )
                 );
 
-
                 await item.click({
-                    timeout:
-                        3000
+                    timeout: 3000
                 });
 
-
                 console.log(
-                    `[Worker ${this.sessionId}] ` +
-                    `Changed chart timeframe -> ` +
-                    `${timeframe}`
+                    `[Worker ${this.sessionId}] Changed chart timeframe -> ${timeframe}`
                 );
-
 
                 return true;
             }
 
-
         } catch (error) {
 
             console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Timeframe lookup error: ` +
-                `${error.message}`
+                `[Worker ${this.sessionId}] Timeframe lookup error: ${error.message}`
             );
         }
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Could not click timeframe "${timeframe}"`
+            `[Worker ${this.sessionId}] Could not click timeframe "${timeframe}"`
         );
-
 
         return false;
     }
-
-
-    /*
-    ================================================================
-    INTERNAL PANEL SCROLLING
-    ================================================================
-    */
 
     async scrollPage(
         page,
         totalDelta
     ) {
-
         const direction =
             totalDelta > 0
                 ? 'DOWN'
                 : 'UP';
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Scrolling ${direction} ` +
-            `${Math.abs(totalDelta)}px`
+            `[Worker ${this.sessionId}] Scrolling ${direction} ${Math.abs(totalDelta)}px`
         );
-
 
         const result =
             await page.evaluate(
@@ -1097,46 +863,37 @@ class ResearchWorker {
                     function visibleArea(
                         element
                     ) {
-
                         const rect =
                             element
                                 .getBoundingClientRect();
 
-
                         const width =
                             Math.max(
                                 0,
-
                                 Math.min(
                                     rect.right,
                                     window.innerWidth
                                 ) -
-
                                 Math.max(
                                     rect.left,
                                     0
                                 )
                             );
 
-
                         const height =
                             Math.max(
                                 0,
-
                                 Math.min(
                                     rect.bottom,
                                     window.innerHeight
                                 ) -
-
                                 Math.max(
                                     rect.top,
                                     0
                                 )
                             );
 
-
                         return {
-
                             area:
                                 width *
                                 height,
@@ -1147,52 +904,36 @@ class ResearchWorker {
                         };
                     }
 
-
                     function isScrollable(
                         element
                     ) {
-
                         const style =
                             window.getComputedStyle(
                                 element
                             );
 
-
                         if (
                             style.display === 'none' ||
                             style.visibility === 'hidden'
                         ) {
-
                             return false;
                         }
-
 
                         const range =
                             element.scrollHeight -
                             element.clientHeight;
 
-
                         return (
-
                             range > 100 &&
-
                             (
-                                style.overflowY ===
-                                    'auto' ||
-
-                                style.overflowY ===
-                                    'scroll' ||
-
-                                style.overflowY ===
-                                    'overlay'
+                                style.overflowY === 'auto' ||
+                                style.overflowY === 'scroll' ||
+                                style.overflowY === 'overlay'
                             )
                         );
                     }
 
-
-                    const candidates =
-                        [];
-
+                    const candidates = [];
 
                     const elements =
                         Array.from(
@@ -1201,53 +942,44 @@ class ResearchWorker {
                             )
                         );
 
-
                     for (
-                        const element of
-                        elements
+                        const element
+                        of elements
                     ) {
-
                         if (
                             !isScrollable(
                                 element
                             )
                         ) {
-
                             continue;
                         }
-
 
                         const visibility =
                             visibleArea(
                                 element
                             );
 
-
                         if (
                             visibility.width < 150 ||
                             visibility.height < 150
                         ) {
-
                             continue;
                         }
 
-
                         const rect =
                             visibility.rect;
-
 
                         const maxScroll =
                             element.scrollHeight -
                             element.clientHeight;
 
-
                         const centreX =
-                            window.innerWidth / 2;
-
+                            window.innerWidth /
+                            2;
 
                         const centreY =
-                            window.innerHeight / 2;
-
+                            window.innerHeight /
+                            2;
 
                         const containsCentre =
                             centreX >= rect.left &&
@@ -1255,19 +987,15 @@ class ResearchWorker {
                             centreY >= rect.top &&
                             centreY <= rect.bottom;
 
-
                         let score =
                             visibility.area;
-
 
                         if (
                             containsCentre
                         ) {
-
                             score +=
                                 1000000;
                         }
-
 
                         score +=
                             Math.min(
@@ -1275,9 +1003,7 @@ class ResearchWorker {
                                 10000
                             );
 
-
                         candidates.push({
-
                             element,
                             score,
                             maxScroll,
@@ -1285,56 +1011,43 @@ class ResearchWorker {
                         });
                     }
 
-
                     candidates.sort(
                         (a, b) =>
                             b.score -
                             a.score
                     );
 
-
                     if (
                         candidates.length ===
                         0
                     ) {
-
                         return {
-                            success:
-                                false,
-
-                            candidatesFound:
-                                0
+                            success: false,
+                            candidatesFound: 0
                         };
                     }
-
 
                     const target =
                         candidates[0]
                             .element;
 
-
                     const before =
                         target.scrollTop;
-
 
                     const steps =
                         10;
 
-
                     const step =
                         delta /
                         steps;
-
 
                     for (
                         let i = 0;
                         i < steps;
                         i++
                     ) {
-
                         target.scrollTop +=
                             step;
-
 
                         await new Promise(
                             resolve =>
@@ -1345,18 +1058,14 @@ class ResearchWorker {
                         );
                     }
 
-
                     const after =
                         target.scrollTop;
-
 
                     const rect =
                         target
                             .getBoundingClientRect();
 
-
                     return {
-
                         success:
                             before !==
                             after,
@@ -1376,7 +1085,6 @@ class ResearchWorker {
 
                         maxScroll:
                             Math.round(
-
                                 target.scrollHeight -
                                 target.clientHeight
                             ),
@@ -1402,65 +1110,42 @@ class ResearchWorker {
                             )
                     };
                 },
-
                 totalDelta
             );
 
-
-        if (
-            result.success
-        ) {
+        if (result.success) {
 
             console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Panel scroll: ` +
-                `${result.before} -> ` +
-                `${result.after} / ` +
-                `${result.maxScroll}`
+                `[Worker ${this.sessionId}] Panel scroll: ` +
+                `${result.before} -> ${result.after} / ${result.maxScroll}`
             );
 
-
             console.log(
-                `[Worker ${this.sessionId}] ` +
-                `Panel: ` +
-                `${result.width}x` +
-                `${result.height} at ` +
-                `${result.x},${result.y}`
+                `[Worker ${this.sessionId}] Panel: ` +
+                `${result.width}x${result.height} at ${result.x},${result.y}`
             );
 
         } else {
 
             console.log(
-                `[Worker ${this.sessionId}] ` +
-                `No panel was scrolled`
+                `[Worker ${this.sessionId}] No panel was scrolled`
             );
         }
     }
-
-
-    /*
-    ================================================================
-    TABLE BUTTONS
-    ================================================================
-    */
 
     async performSafeClick(
         page,
         cycle
     ) {
-
         const labels =
             config.SAFE_CLICK_TEXTS;
-
 
         if (
             !labels ||
             labels.length === 0
         ) {
-
             return false;
         }
-
 
         const text =
             labels[
@@ -1468,12 +1153,9 @@ class ResearchWorker {
                 labels.length
             ];
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Looking for "${text}"`
+            `[Worker ${this.sessionId}] Looking for "${text}"`
         );
-
 
         const roles = [
             'tab',
@@ -1481,13 +1163,11 @@ class ResearchWorker {
             'link'
         ];
 
-
         for (
-            const role of roles
+            const role
+            of roles
         ) {
-
             try {
-
                 const locator =
                     page
                         .getByRole(
@@ -1502,27 +1182,22 @@ class ResearchWorker {
                         )
                         .first();
 
-
                 const visible =
                     await locator
                         .isVisible()
                         .catch(
-                            () => false
+                            () =>
+                                false
                         );
 
-
                 if (!visible) {
-
                     continue;
                 }
-
 
                 await locator
                     .scrollIntoViewIfNeeded();
 
-
                 await locator.hover();
-
 
                 await this.sleep(
                     this.randomBetween(
@@ -1531,71 +1206,44 @@ class ResearchWorker {
                     )
                 );
 
-
                 await locator.click({
                     timeout:
                         3000
                 });
 
-
                 console.log(
-                    `[Worker ${this.sessionId}] ` +
-                    `Clicked "${text}" (${role})`
+                    `[Worker ${this.sessionId}] Clicked "${text}" (${role})`
                 );
-
 
                 return true;
 
-
             } catch (error) {
 
-                /*
-                 * Try next role.
-                 */
+                // Try next role
             }
         }
 
-
         console.log(
-            `[Worker ${this.sessionId}] ` +
-            `Could not click "${text}"`
+            `[Worker ${this.sessionId}] Could not click "${text}"`
         );
-
 
         return false;
     }
 
-
-    /*
-    ================================================================
-    HELPERS
-    ================================================================
-    */
-
     async randomPause() {
-
         const ms =
             this.randomBetween(
-
-                config
-                    .PAUSE_BETWEEN_ACTIONS_RANGE_MS[0],
-
-                config
-                    .PAUSE_BETWEEN_ACTIONS_RANGE_MS[1]
+                config.PAUSE_BETWEEN_ACTIONS_RANGE_MS[0],
+                config.PAUSE_BETWEEN_ACTIONS_RANGE_MS[1]
             );
 
-
-        await this.sleep(
-            ms
-        );
+        await this.sleep(ms);
     }
-
 
     randomBetween(
         min,
         max
     ) {
-
         return Math.floor(
             Math.random() *
             (
@@ -1606,11 +1254,7 @@ class ResearchWorker {
         ) + min;
     }
 
-
-    randomFrom(
-        array
-    ) {
-
+    randomFrom(array) {
         return array[
             Math.floor(
                 Math.random() *
@@ -1619,9 +1263,7 @@ class ResearchWorker {
         ];
     }
 
-
     sleep(ms) {
-
         return new Promise(
             resolve =>
                 setTimeout(
@@ -1632,6 +1274,4 @@ class ResearchWorker {
     }
 }
 
-
-module.exports =
-    ResearchWorker;
+module.exports = ResearchWorker;
