@@ -11,7 +11,7 @@ chromium.use(stealth);
 class ResearchWorker {
     constructor(sessionId) {
         this.sessionId = sessionId;
-        this.identity = IdentityFactory.generate();
+        this.identity = null;
 
         /*
          * Proxy is retrieved asynchronously when the worker starts.
@@ -20,22 +20,9 @@ class ResearchWorker {
     }
 
     async start() {
-        console.log(`\n[Worker ${this.sessionId}] Initializing identity...`);
-        console.log(`[Worker ${this.sessionId}] UA: ${this.identity.userAgent}`);
-        console.log(
-            `[Worker ${this.sessionId}] Viewport: ` +
-            `${this.identity.viewport.width}x${this.identity.viewport.height}`
-        );
-        console.log(`[Worker ${this.sessionId}] Timezone: ${this.identity.timezone}`);
-        console.log(`[Worker ${this.sessionId}] Locale: ${this.identity.locale}`);
-        console.log(`[Worker ${this.sessionId}] Platform: ${this.identity.platform}`);
-        console.log(
-            `[Worker ${this.sessionId}] Hardware Concurrency: ` +
-            `${this.identity.hardwareConcurrency}`
-        );
 
         console.log(
-            `[Worker ${this.sessionId}] Requesting ASocks proxy...`
+            `\n[Worker ${this.sessionId}] Requesting ASocks proxy...`
         );
 
         this.proxy =
@@ -43,8 +30,44 @@ class ResearchWorker {
                 this.sessionId
             );
 
+        // Generate identity AFTER we know the proxy region
+        this.identity =
+            IdentityFactory.generateForRegion(
+                this.proxy.region
+            );
+
         console.log(
             `[Worker ${this.sessionId}] ASocks proxy acquired successfully`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Identity region: ${this.proxy.region}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] UA: ${this.identity.userAgent}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Viewport: ` +
+            `${this.identity.viewport.width}x${this.identity.viewport.height}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Timezone: ${this.identity.timezone}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Locale: ${this.identity.locale}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Platform: ${this.identity.platform}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] Hardware Concurrency: ` +
+            `${this.identity.hardwareConcurrency}`
         );
 
         const launchArgs = [
@@ -78,22 +101,27 @@ class ResearchWorker {
             );
         }
 
-        const browser = await chromium.launch(
-            launchOptions
-        );
+        const browser = await chromium.launch(launchOptions);
+
+        // Correctly derive Client Hints based on the generated platform.
+        let chPlatform = '"Windows"';
+        if (this.identity.platform === 'MacIntel') chPlatform = '"macOS"';
+        if (this.identity.platform === 'Linux x86_64') chPlatform = '"Linux"';
 
         const context = await browser.newContext({
             userAgent: this.identity.userAgent,
             viewport: this.identity.viewport,
             timezoneId: this.identity.timezone,
             locale: this.identity.locale,
-
-            extraHTTPHeaders: {
-                'sec-ch-ua-platform': `${this.identity.platform}`
-            },
-
             deviceScaleFactor: this.identity.deviceScaleFactor,
-            permissions: ['geolocation']
+            permissions: ['geolocation'],
+
+            // Keep Client Hints aligned with the generated browser identity.
+            extraHTTPHeaders: {
+                'sec-ch-ua-platform': chPlatform,
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua': '"Google Chrome";v="135", "Not=A?Brand";v="8", "Chromium";v="135"'
+            }
         });
 
         await context.addInitScript(() => {
@@ -140,16 +168,6 @@ class ResearchWorker {
         page.setDefaultNavigationTimeout(
             config.NAVIGATION_TIMEOUT_MS
         );
-
-        // --- DATA SAVER LOGIC ---
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            if (['image', 'font', 'media'].includes(type)) {
-                route.abort();
-            } else {
-                route.continue();
-            }
-        });
 
         try {
             await this.loadDexScreener(page);
@@ -225,7 +243,9 @@ class ResearchWorker {
      * Detects and solves Cloudflare Turnstile automatically
      */
     async handleCloudflare(page) {
-        console.log(`[Worker ${this.sessionId}] Checking for Cloudflare challenges...`);
+        console.log(
+            `[Worker ${this.sessionId}] Checking for Cloudflare challenges...`
+        );
 
         // Wait for potential challenge to appear
         await this.sleep(5000);
@@ -238,6 +258,7 @@ class ResearchWorker {
         ];
 
         let challengeFound = false;
+
         for (const selector of cloudflareSelectors) {
             if (await page.locator(selector).count() > 0) {
                 challengeFound = true;
@@ -246,81 +267,535 @@ class ResearchWorker {
         }
 
         if (challengeFound) {
-            console.log(`[Worker ${this.sessionId}] Cloudflare challenge detected. Attempting solve...`);
+            console.log(
+                `[Worker ${this.sessionId}] Cloudflare challenge detected. Attempting solve...`
+            );
 
             try {
                 // Find the Turnstile checkbox iframe
-                const frame = page.frames().find(f =>
-                    f.url().includes('turnstile') || f.url().includes('cloudflare')
+                const frame = page.frames().find(
+                    f =>
+                        f.url().includes('turnstile') ||
+                        f.url().includes('cloudflare')
                 );
 
                 if (frame) {
-                    // We don't click the selector directly (which is easily detected)
-                    // Instead, we find the coordinates and perform a human-like click
-                    const box = await page.locator('iframe[src*="cloudflare"]').boundingBox();
-                    if (box) {
-                        const clickX = box.x + (box.width / 2) + (Math.random() * 10 - 5);
-                        const clickY = box.y + (box.height / 2) + (Math.random() * 10 - 5);
+                    // We don't click the selector directly.
+                    // Instead find its position and use the mouse.
+                    const box =
+                        await page
+                            .locator('iframe[src*="cloudflare"]')
+                            .boundingBox();
 
-                        await page.mouse.move(clickX, clickY, { steps: 15 });
+                    if (box) {
+                        const clickX =
+                            box.x +
+                            (box.width / 2) +
+                            (Math.random() * 10 - 5);
+
+                        const clickY =
+                            box.y +
+                            (box.height / 2) +
+                            (Math.random() * 10 - 5);
+
+                        await page.mouse.move(
+                            clickX,
+                            clickY,
+                            {
+                                steps: 15
+                            }
+                        );
+
                         await page.mouse.down();
-                        await this.sleep(this.randomBetween(100, 250));
+
+                        await this.sleep(
+                            this.randomBetween(
+                                100,
+                                250
+                            )
+                        );
+
                         await page.mouse.up();
 
-                        console.log(`[Worker ${this.sessionId}] Bypassed Cloudflare checkbox.`);
+                        console.log(
+                            `[Worker ${this.sessionId}] Bypassed Cloudflare checkbox.`
+                        );
                     }
                 }
+
             } catch (e) {
-                console.log(`[Worker ${this.sessionId}] Automated solve failed, waiting for auto-clear...`);
+                console.log(
+                    `[Worker ${this.sessionId}] Automated solve failed, waiting for auto-clear...`
+                );
             }
 
             // Wait for the page to actually load after solve
-            await page.waitForSelector('canvas', { timeout: 30000 }).catch(() => {
-                console.log(`[Worker ${this.sessionId}] Page did not load canvas after solve.`);
-            });
+            await page
+                .waitForSelector(
+                    'canvas',
+                    {
+                        timeout: 30000
+                    }
+                )
+                .catch(() => {
+                    console.log(
+                        `[Worker ${this.sessionId}] Page did not load canvas after solve.`
+                    );
+                });
+
         } else {
-            console.log(`[Worker ${this.sessionId}] No Cloudflare challenge visible.`);
+            console.log(
+                `[Worker ${this.sessionId}] No Cloudflare challenge visible.`
+            );
         }
     }
 
-    async loadDexScreener(page) {
-        const referrer =
-            this.randomFrom(
-                config.REFERRERS
-            );
+        /**
+     * Simulates natural human keyboard entry by introducing a random 
+     * delay between every keypress.
+     */
+    async typeLikeHuman(page, selector, text) {
+        const element = page.locator(selector).first();
+        await element.click();
+        
+        // Brief pause after focusing the input box
+        await this.sleep(this.randomBetween(250, 600)); 
+        
+        for (const character of text) {
+            await element.type(character, { 
+                delay: this.randomBetween(50, 150) // Variance in milliseconds per key
+            });
+        }
+    }
 
-        console.log(
-            `\n[Worker ${this.sessionId}] Opening DEX Screener with referrer: ${referrer}`
+        async loadDexScreener(page) {
+
+    const referrer =
+        this.randomFrom(
+            config.REFERRERS
         );
 
-        await page.goto(
-            config.TARGET_URL,
+    console.log(
+        `\n[Worker ${this.sessionId}] ` +
+        `Accessing DEX Screener homepage via: ${referrer}`
+    );
+
+    /*
+     * STEP 1
+     * Open DEX Screener homepage.
+     */
+    await page.goto(
+        config.TARGET_URL,
+        {
+            waitUntil: 'domcontentloaded',
+            timeout: config.NAVIGATION_TIMEOUT_MS,
+            referer: referrer
+        }
+    );
+
+    console.log(
+        `[Worker ${this.sessionId}] Root landing view loaded.`
+    );
+
+    await this.sleep(
+        config.INITIAL_LOAD_WAIT_MS
+    );
+
+    await page.bringToFront();
+
+    try {
+
+        console.log(
+            `[Worker ${this.sessionId}] Initialising UI search workflow...`
+        );
+
+        /*
+         * STEP 2
+         * DEX Screener does NOT initially expose the search
+         * textbox.
+         *
+         * "/" is the keyboard shortcut displayed by the
+         * Search control on the website.
+         */
+        console.log(
+            `[Worker ${this.sessionId}] Opening DEX Screener search...`
+        );
+
+        await page.keyboard.press('/');
+
+        await this.sleep(
+            this.randomBetween(
+                400,
+                900
+            )
+        );
+
+        /*
+         * STEP 3
+         * Find the textbox that appears after opening Search.
+         */
+        const searchSelectors = [
+            'input[placeholder="Search"]',
+            'input[placeholder*="Search"]',
+            'input[type="search"]',
+            '[role="dialog"] input'
+        ];
+
+        let searchInput = null;
+
+        for (
+            const selector
+            of searchSelectors
+        ) {
+
+            const matches =
+                page.locator(
+                    selector
+                );
+
+            const count =
+                await matches.count();
+
+            for (
+                let i = 0;
+                i < count;
+                i++
+            ) {
+
+                const candidate =
+                    matches.nth(i);
+
+                try {
+
+                    if (
+                        await candidate.isVisible()
+                    ) {
+
+                        searchInput =
+                            candidate;
+
+                        break;
+                    }
+
+                } catch (error) {
+
+                    // Ignore stale/non-visible candidates.
+                }
+            }
+
+            if (searchInput) {
+                break;
+            }
+        }
+
+        /*
+         * If "/" did not open Search for some reason,
+         * explicitly click the visible Search control.
+         */
+        if (!searchInput) {
+
+            console.log(
+                `[Worker ${this.sessionId}] `/ +
+                ` shortcut did not reveal input. Trying Search button...`
+            );
+
+            const searchTrigger =
+                page
+                    .getByText(
+                        /^Search/i
+                    )
+                    .first();
+
+            if (
+                await searchTrigger.count() > 0 &&
+                await searchTrigger.isVisible()
+            ) {
+
+                await searchTrigger.click();
+
+                await this.sleep(
+                    this.randomBetween(
+                        400,
+                        900
+                    )
+                );
+            }
+
+            /*
+             * Search again for the now-visible input.
+             */
+            for (
+                const selector
+                of searchSelectors
+            ) {
+
+                const matches =
+                    page.locator(
+                        selector
+                    );
+
+                const count =
+                    await matches.count();
+
+                for (
+                    let i = 0;
+                    i < count;
+                    i++
+                ) {
+
+                    const candidate =
+                        matches.nth(i);
+
+                    try {
+
+                        if (
+                            await candidate.isVisible()
+                        ) {
+
+                            searchInput =
+                                candidate;
+
+                            break;
+                        }
+
+                    } catch (error) {
+
+                        // Ignore stale candidates.
+                    }
+                }
+
+                if (searchInput) {
+                    break;
+                }
+            }
+        }
+
+        /*
+         * Search-only mode.
+         *
+         * Do NOT navigate directly to the token page.
+         */
+        if (!searchInput) {
+
+            throw new Error(
+                'DEX Screener search input could not be opened.'
+            );
+        }
+
+        console.log(
+            `[Worker ${this.sessionId}] Search box opened successfully.`
+        );
+
+        /*
+         * STEP 4
+         * Focus the actual DEX Screener search textbox.
+         */
+        await searchInput.click();
+
+        await this.sleep(
+            this.randomBetween(
+                250,
+                600
+            )
+        );
+
+        /*
+         * Make sure there is no existing text.
+         */
+        await searchInput.fill('');
+
+        /*
+         * STEP 5
+         * Type the contract address through the actual UI.
+         */
+        console.log(
+            `[Worker ${this.sessionId}] Typing contract address into search...`
+        );
+
+        for (
+            const character
+            of config.TOKEN_CONTRACT_ADDRESS
+        ) {
+
+            await searchInput.type(
+                character,
+                {
+                    delay:
+                        this.randomBetween(
+                            45,
+                            110
+                        )
+                }
+            );
+        }
+
+        console.log(
+            `[Worker ${this.sessionId}] Contract address entered into search.`
+        );
+
+        /*
+         * Give DEX Screener time to populate its results.
+         */
+        await this.sleep(
+            this.randomBetween(
+                1500,
+                3000
+            )
+        );
+
+        /*
+         * STEP 6
+         * Look for a result whose link contains the exact
+         * target address.
+         */
+        const targetAddress =
+            config
+                .TOKEN_CONTRACT_ADDRESS
+                .toLowerCase();
+
+        const links =
+            page.locator(
+                'a[href]'
+            );
+
+        const linkCount =
+            await links.count();
+
+        let resultClicked =
+            false;
+
+        for (
+            let i = 0;
+            i < linkCount;
+            i++
+        ) {
+
+            const link =
+                links.nth(i);
+
+            let href =
+                null;
+
+            try {
+
+                href =
+                    await link.getAttribute(
+                        'href'
+                    );
+
+            } catch (error) {
+
+                continue;
+            }
+
+            if (
+                href &&
+                href
+                    .toLowerCase()
+                    .includes(
+                        targetAddress
+                    )
+            ) {
+
+                try {
+
+                    if (
+                        await link.isVisible()
+                    ) {
+
+                        console.log(
+                            `[Worker ${this.sessionId}] ` +
+                            `Matching search result found. Clicking...`
+                        );
+
+                        await link.click();
+
+                        resultClicked =
+                            true;
+
+                        break;
+                    }
+
+                } catch (error) {
+
+                    // Continue looking.
+                }
+            }
+        }
+
+        /*
+         * Some DEX Screener search results don't expose the
+         * complete address in the result link.
+         *
+         * In that case select the highlighted first result
+         * with Enter.
+         */
+        if (!resultClicked) {
+
+            console.log(
+                `[Worker ${this.sessionId}] ` +
+                `Exact result link not exposed. Selecting search result with Enter...`
+            );
+
+            await page.keyboard.press(
+                'Enter'
+            );
+        }
+
+        /*
+         * STEP 7
+         * Confirm that the search interaction actually took
+         * us away from the homepage and into Robinhood.
+         */
+        await page.waitForURL(
+            url => {
+
+                return (
+                    url.hostname.includes(
+                        'dexscreener.com'
+                    ) &&
+                    url.pathname.includes(
+                        '/robinhood/'
+                    )
+                );
+
+            },
             {
-                waitUntil: 'domcontentloaded',
-                timeout:
-                    config.NAVIGATION_TIMEOUT_MS,
-                referer: referrer
+                timeout: 25000
             }
         );
 
         console.log(
-            `[Worker ${this.sessionId}] DOM loaded`
-        );
-
-        await this.sleep(
-            config.INITIAL_LOAD_WAIT_MS
-        );
-
-        await page.bringToFront();
-
-        console.log(
-            `[Worker ${this.sessionId}] Page title: ${await page.title()}`
+            `[Worker ${this.sessionId}] Search navigation successful.`
         );
 
         console.log(
             `[Worker ${this.sessionId}] Current URL: ${page.url()}`
         );
+
+        console.log(
+            `[Worker ${this.sessionId}] Page title: ${await page.title()}`
+        );
+
+    } catch (searchError) {
+
+        console.error(
+            `\n[Worker ${this.sessionId}] ` +
+            `Search workflow failed: ${searchError.message}`
+        );
+
+        console.log(
+            `[Worker ${this.sessionId}] ` +
+            `Search-only mode enabled. Closing this worker.`
+        );
+
+        /*
+         * IMPORTANT:
+         * No direct URL fallback.
+         */
+        throw searchError;
     }
+}
 
     async interactionLoop(page) {
         console.log(
@@ -362,8 +837,7 @@ class ResearchWorker {
                 );
 
             const direction =
-                cycle ===
-                config.INTERACTION_CYCLES
+                cycle === config.INTERACTION_CYCLES
                     ? -1
                     : 1;
 
@@ -613,8 +1087,7 @@ class ResearchWorker {
 
                     if (
                         rect.left >
-                        viewportWidth *
-                        0.80
+                        viewportWidth * 0.80
                     ) {
                         continue;
                     }
@@ -1018,8 +1491,7 @@ class ResearchWorker {
                     );
 
                     if (
-                        candidates.length ===
-                        0
+                        candidates.length === 0
                     ) {
                         return {
                             success: false,
@@ -1067,8 +1539,7 @@ class ResearchWorker {
 
                     return {
                         success:
-                            before !==
-                            after,
+                            before !== after,
 
                         candidatesFound:
                             candidates.length,

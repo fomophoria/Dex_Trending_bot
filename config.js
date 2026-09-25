@@ -1,13 +1,22 @@
 // config.js
-module.exports = {
-    TARGET_URL:
-        'https://dexscreener.com/robinhood/0xc7b8d8176ec8bd0658e4c2b6f8e269bcd7b1b444bc2b1e68b653e128481f6454',
 
-    MAX_CONCURRENT_SESSIONS: 30,
+module.exports = {
+
+    // 1. Change from inner token path to root landing page
+    TARGET_URL: 'https://dexscreener.com/',
+
+    // 2. Isolate the target contract address (CA) for input simulation
+    TOKEN_CONTRACT_ADDRESS: '0xc7b8d8176ec8bd0658e4c2b6f8e269bcd7b1b444bc2b1e68b653e128481f6454',
+
+    // 3. Define the platform's standard UI locator query
+    SEARCH_INPUT_SELECTOR: 'input[placeholder*="Search"], input[type="text"]',
+
+    // Retain remainder of your concurrency configurations
+    MAX_CONCURRENT_SESSIONS: 10,
 
     // New limits that your launcher can respect
     MIN_ACTIVE_SESSIONS: 5,
-    MAX_ACTIVE_SESSIONS: 30,
+    MAX_ACTIVE_SESSIONS: 10,
 
     // Random delays to stagger worker starts and restarts
     WORKER_START_DELAY_RANGE_MS: [2000, 12000],
@@ -29,7 +38,7 @@ module.exports = {
     CHART_TIMEFRAMES: ['5m', '15m', '1h', '4h'],
 
     /*
-     * Number of mouse‑wheel actions over the chart.
+     * Number of mouse-wheel actions over the chart.
      */
     CHART_ZOOM_OUT_STEPS: [2, 5],
 
@@ -39,11 +48,14 @@ module.exports = {
      */
     CHART_ZOOM_DELTA: 300,
 
-    SAFE_CLICK_TEXTS: ['Transactions', 'Top Traders'],
+    SAFE_CLICK_TEXTS: [
+        'Transactions',
+        'Top Traders'
+    ],
 
     /*
      * Rotating residential proxy gateway.
-     * Replace the placeholder with your provider’s gateway URL.
+     * Replace the placeholder with your provider's gateway URL.
      * Example: 'http://username:password@gate.smartproxy.com:7000'
      */
     PROXY_LIST: [
@@ -56,4 +68,5 @@ module.exports = {
         'https://www.google.com/',
         'https://docs.dexscreener.com/'
     ]
+
 };
