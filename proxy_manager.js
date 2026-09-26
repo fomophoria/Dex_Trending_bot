@@ -1,37 +1,23 @@
 // proxy_manager.js
 
 class ProxyManager {
+    static API_BASE = 'https://api.asocks.com/v2';
 
     /*
-     * Keep the API key outside source control.
+     * Keep the API key in the environment.
      *
-     * PowerShell example:
+     * PowerShell:
+     *   $env:ASOCKS_API_KEY = "YOUR_KEY"
      *
-     * $env:ASOCKS_API_KEY="YOUR_NEW_KEY"
-     *
-     * Then:
-     *
-     * npm start
+     * Do NOT hard-code it here, especially if this project is pushed
+     * to GitHub.
      */
-
     static API_KEY = process.env.ASOCKS_API_KEY;
 
     /*
-     * ASocks API endpoints.
+     * Regions supported by the rest of the project.
+     * These match IdentityFactory.REGIONAL_DATA.
      */
-
-    static API_BASE_URL =
-        'https://api.asocks.com/v2';
-
-    /*
-     * Region rotation.
-     *
-     * Worker 1 -> US
-     * Worker 2 -> GB
-     * Worker 3 -> DE
-     * etc.
-     */
-
     static REGIONS = [
         'us',
         'gb',
@@ -45,555 +31,605 @@ class ProxyManager {
         'ch',
         'au',
         'sg',
-        'jp'
+        'jp',
+        'br',
+        'kr',
+        'in'
     ];
 
     /*
-     * Sticky proxy lifetime metadata.
-     *
-     * ASocks now supplies the actual proxy/session credentials
-     * dynamically through the API.
-     *
-     * We cache one returned proxy per worker so that the worker
-     * continues using the same proxy throughout its session.
+     * Number of proxies to ask ASocks for per request.
      */
-
-    static SESSION_LIFETIME_MINUTES = 15;
+    static SEARCH_LIMIT = 10;
 
     /*
-     * Proxy cache.
-     *
-     * worker 1 -> proxy A
-     * worker 2 -> proxy B
-     * etc.
+     * Maximum amount of time to wait for the ASocks API.
      */
+    static API_TIMEOUT_MS = 15000;
 
-    static PROXY_CACHE =
-        new Map();
+    /*
+     * Internal counter only.
+     *
+     * This is NOT used to manufacture proxy credentials.
+     */
+    static SESSION_COUNTER = 0;
 
-    static ensureConfigured() {
 
-        if (
-            !this.API_KEY ||
-            typeof this.API_KEY !== 'string' ||
-            this.API_KEY.trim().length === 0
-        ) {
-            throw new Error(
-                'ASOCKS_API_KEY environment variable is not configured.'
-            );
-        }
+    // ================================================================
+    // UTILITY METHODS
+    // ================================================================
+
+    static getRandomRegion() {
+        return this.REGIONS[
+            Math.floor(Math.random() * this.REGIONS.length)
+        ];
     }
 
-    /*
-     * Retrieve the current ASocks account balance.
-     */
 
-    static async getBalance() {
+    static randomFrom(array) {
+        return array[
+            Math.floor(Math.random() * array.length)
+        ];
+    }
 
-        this.ensureConfigured();
 
-        const url =
-            `${this.API_BASE_URL}/user/balance` +
-            `?apiKey=${encodeURIComponent(this.API_KEY)}`;
+    static shuffle(array) {
+        const copy = [...array];
 
-        const response =
-            await fetch(
+        for (let i = copy.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+
+            [copy[i], copy[j]] = [
+                copy[j],
+                copy[i]
+            ];
+        }
+
+        return copy;
+    }
+
+
+    // ================================================================
+    // ASOCKS API REQUEST
+    // ================================================================
+
+    static async requestJson(endpoint, params = {}) {
+        if (!this.API_KEY) {
+            throw new Error(
+                'ASOCKS_API_KEY environment variable is not set'
+            );
+        }
+
+        const url = new URL(
+            `${this.API_BASE}${endpoint}`
+        );
+
+        /*
+         * ASocks documentation specifies apiKey as a query parameter.
+         */
+        url.searchParams.set(
+            'apiKey',
+            this.API_KEY
+        );
+
+        for (const [key, value] of Object.entries(params)) {
+            if (
+                value !== undefined &&
+                value !== null &&
+                value !== ''
+            ) {
+                url.searchParams.set(
+                    key,
+                    String(value)
+                );
+            }
+        }
+
+        const controller = new AbortController();
+
+        const timeout = setTimeout(
+            () => controller.abort(),
+            this.API_TIMEOUT_MS
+        );
+
+        try {
+            const response = await fetch(
                 url,
                 {
                     method: 'GET',
 
                     headers: {
-                        accept:
-                            'application/json'
-                    }
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    },
+
+                    signal: controller.signal
                 }
             );
 
-        if (!response.ok) {
+            const raw = await response.text();
 
-            throw new Error(
-                `ASocks balance request failed: ` +
-                `${response.status} ${response.statusText}`
-            );
+            let data;
+
+            try {
+                data = JSON.parse(raw);
+            } catch (error) {
+                throw new Error(
+                    `ASocks returned invalid JSON: ${raw.slice(0, 200)}`
+                );
+            }
+
+            if (!response.ok) {
+                const message =
+                    data?.message ||
+                    data?.error ||
+                    `HTTP ${response.status}`;
+
+                throw new Error(
+                    `ASocks API error: ${message}`
+                );
+            }
+
+            if (data?.success === false) {
+                throw new Error(
+                    `ASocks API rejected request: ${
+                        data?.message ||
+                        data?.error ||
+                        'unknown error'
+                    }`
+                );
+            }
+
+            return data;
+
+        } catch (error) {
+
+            if (error.name === 'AbortError') {
+                throw new Error(
+                    `ASocks API timed out after ${this.API_TIMEOUT_MS}ms`
+                );
+            }
+
+            throw error;
+
+        } finally {
+            clearTimeout(timeout);
         }
+    }
 
-        const data =
-            await response.json();
 
-        const balance =
-            Number(
-                data.balance
-            );
+    // ================================================================
+    // BALANCE
+    // ================================================================
 
-        if (
-            !Number.isFinite(
-                balance
-            )
-        ) {
+    static async getBalance() {
+        const data = await this.requestJson(
+            '/user/balance'
+        );
 
+        /*
+         * ASocks currently returns:
+         *
+         * {
+         *   success: true,
+         *   balance: "...",
+         *   balance_traffic: "...",
+         *   all_available_traffic: "...",
+         *   ...
+         * }
+         */
+
+        const balance = Number(
+            data?.balance
+        );
+
+        if (!Number.isFinite(balance)) {
             throw new Error(
-                'ASocks returned an invalid balance response.'
+                'ASocks returned an invalid balance value'
             );
         }
 
         return balance;
     }
 
-    /*
-     * Pick a region for a worker.
-     *
-     * Worker 1 -> first region
-     * Worker 2 -> second region
-     * etc.
-     */
 
-    static getRegion(sessionId) {
+    // ================================================================
+    // FIND PROXY STRINGS INSIDE ASOCKS RESPONSE
+    // ================================================================
 
-        const numericSessionId =
-            Number(
-                sessionId
-            );
+    static extractProxyCandidates(data) {
+        const results = new Set();
 
-        if (
-            !Number.isInteger(
-                numericSessionId
-            ) ||
-            numericSessionId < 1
-        ) {
+        const inspect = (value) => {
 
-            throw new Error(
-                `Invalid proxy session ID: ${sessionId}`
-            );
-        }
+            if (typeof value === 'string') {
+                const candidate = value.trim();
 
-        const index =
-            (
-                numericSessionId -
-                1
-            ) %
-            this.REGIONS.length;
+                if (this.looksLikeProxy(candidate)) {
+                    results.add(candidate);
+                }
 
-        return this.REGIONS[
-            index
-        ];
-    }
+                return;
+            }
 
-    /*
-     * Recursively search an ASocks API response for
-     * authenticated HTTP proxy URLs.
-     *
-     * This deliberately supports several possible response
-     * structures instead of assuming that ASocks always
-     * returns the array under one particular property name.
-     */
+            if (Array.isArray(value)) {
+                for (const item of value) {
+                    inspect(item);
+                }
 
-    static extractProxyUrls(value) {
+                return;
+            }
 
-        const proxies =
-            [];
-
-        const walk =
-            item => {
-
-                if (
-                    typeof item ===
-                    'string'
+            if (
+                value &&
+                typeof value === 'object'
+            ) {
+                for (
+                    const [key, item] of Object.entries(value)
                 ) {
-
+                    /*
+                     * Ignore obvious non-proxy metadata.
+                     */
                     if (
-                        item.startsWith(
-                            'http://'
-                        ) ||
-                        item.startsWith(
-                            'https://'
-                        )
+                        key === 'success' ||
+                        key === 'balance' ||
+                        key === 'balance_traffic' ||
+                        key === 'all_available_traffic' ||
+                        key === 'prepared_traffic_balance' ||
+                        key === 'balance_hold'
                     ) {
-
-                        try {
-
-                            const parsed =
-                                new URL(
-                                    item
-                                );
-
-                            if (
-                                parsed.hostname &&
-                                parsed.port
-                            ) {
-
-                                proxies.push(
-                                    item
-                                );
-                            }
-
-                        } catch (error) {
-
-                            // Ignore non-URL strings.
-                        }
+                        continue;
                     }
 
-                    return;
+                    inspect(item);
                 }
+            }
+        };
 
-                if (
-                    Array.isArray(
-                        item
-                    )
-                ) {
+        inspect(data);
 
-                    for (
-                        const child
-                        of item
-                    ) {
-
-                        walk(
-                            child
-                        );
-                    }
-
-                    return;
-                }
-
-                if (
-                    item &&
-                    typeof item ===
-                    'object'
-                ) {
-
-                    for (
-                        const child
-                        of Object.values(
-                            item
-                        )
-                    ) {
-
-                        walk(
-                            child
-                        );
-                    }
-                }
-            };
-
-        walk(
-            value
-        );
-
-        return proxies;
+        return Array.from(results);
     }
 
-    /*
-     * Request a proxy from ASocks.
-     */
 
-    static async requestProxy(
-        sessionId
-    ) {
-
-        this.ensureConfigured();
-
-        const region =
-            this.getRegion(
-                sessionId
-            );
-
-        /*
-         * ASocks accepts normal uppercase country codes
-         * such as US, GB, DE, etc.
-         */
-
-        const country =
-            region.toUpperCase();
-
-        const url =
-            `${this.API_BASE_URL}/proxy/search` +
-            `?apiKey=${encodeURIComponent(this.API_KEY)}` +
-            `&country=${encodeURIComponent(country)}` +
-            `&limit=1`;
-
-        const response =
-            await fetch(
-                url,
-                {
-                    method:
-                        'GET',
-
-                    headers: {
-                        accept:
-                            'application/json'
-                    }
-                }
-            );
-
+    static looksLikeProxy(value) {
         if (
-            !response.ok
+            !value ||
+            typeof value !== 'string'
         ) {
-
-            throw new Error(
-                `ASocks proxy search failed for ${country}: ` +
-                `${response.status} ${response.statusText}`
-            );
-        }
-
-        const data =
-            await response.json();
-
-        /*
-         * ASocks responses contain:
-         *
-         * success: true
-         * authenticated proxy URL(s)
-         *
-         * Example structure returned by the API ultimately
-         * contains strings in this form:
-         *
-         * http://username:password@ip:port
-         */
-
-        if (
-            data &&
-            Object.prototype.hasOwnProperty.call(
-                data,
-                'success'
-            ) &&
-            data.success === false
-        ) {
-
-            throw new Error(
-                `ASocks proxy search reported failure for ${country}.`
-            );
-        }
-
-        const proxyUrls =
-            this.extractProxyUrls(
-                data
-            );
-
-        if (
-            proxyUrls.length ===
-            0
-        ) {
-
-            throw new Error(
-                `ASocks returned no usable proxy for ${country}.`
-            );
+            return false;
         }
 
         /*
-         * limit=1 means normally only one proxy will be
-         * returned, but use the first valid one regardless.
+         * ASocks may return:
+         *
+         * 185.100.xxx.xxx:9999
+         *
+         * OR
+         *
+         * http://username:password@185.100.xxx.xxx:9999
          */
 
-        const proxyUrl =
-            proxyUrls[0];
+        const valueWithProtocol =
+            /^[a-z]+:\/\//i.test(value)
+                ? value
+                : `http://${value}`;
+
+        try {
+            const parsed = new URL(
+                valueWithProtocol
+            );
+
+            return Boolean(
+                parsed.hostname &&
+                parsed.port
+            );
+
+        } catch (error) {
+            return false;
+        }
+    }
+
+
+    // ================================================================
+    // NORMALISE ASOCKS PROXY
+    // ================================================================
+
+    static parseProxy(candidate) {
+        if (!candidate) {
+            return null;
+        }
+
+        let value = candidate.trim();
+
+        /*
+         * A bare:
+         *
+         *     1.2.3.4:9999
+         *
+         * is treated as HTTP.
+         */
+        if (!/^[a-z]+:\/\//i.test(value)) {
+            value = `http://${value}`;
+        }
 
         let parsed;
 
         try {
-
-            parsed =
-                new URL(
-                    proxyUrl
-                );
-
+            parsed = new URL(value);
         } catch (error) {
-
-            throw new Error(
-                `ASocks returned an invalid proxy URL for ${country}.`
-            );
+            return null;
         }
 
         if (
             !parsed.hostname ||
             !parsed.port
         ) {
-
-            throw new Error(
-                `ASocks proxy is missing host or port for ${country}.`
-            );
+            return null;
         }
 
-        const username =
-            decodeURIComponent(
+        /*
+         * Preserve the proxy protocol returned by ASocks.
+         */
+        let protocol = parsed.protocol;
+
+        if (!protocol) {
+            protocol = 'http:';
+        }
+
+        const server =
+            `${protocol}//${parsed.hostname}:${parsed.port}`;
+
+        let username;
+
+        let password;
+
+        try {
+            username = parsed.username
+                ? decodeURIComponent(parsed.username)
+                : undefined;
+
+            password = parsed.password
+                ? decodeURIComponent(parsed.password)
+                : undefined;
+
+        } catch (error) {
+            username =
                 parsed.username ||
-                ''
-            );
+                undefined;
 
-        const password =
-            decodeURIComponent(
+            password =
                 parsed.password ||
-                ''
-            );
-
-        if (
-            !username ||
-            !password
-        ) {
-
-            throw new Error(
-                `ASocks proxy is missing authentication credentials for ${country}.`
-            );
+                undefined;
         }
-
-        const sessionID =
-            `worker${sessionId}`;
-
-        const lifetime =
-            this.SESSION_LIFETIME_MINUTES;
-
-        const protocol =
-            parsed.protocol ===
-            'https:'
-                ? 'https:'
-                : 'http:';
 
         return {
-
-            /*
-             * Playwright wants the proxy server without
-             * username/password embedded.
-             */
-
-            server:
-                `${protocol}//${parsed.hostname}:${parsed.port}`,
-
-            /*
-             * Authentication is supplied separately.
-             */
-
-            username:
-                username,
-
-            password:
-                password,
-
-            /*
-             * Metadata used only for logging/debugging.
-             *
-             * Never log username/password.
-             */
-
-            region:
-                region,
-
-            sessionID:
-                sessionID,
-
-            lifetime:
-                lifetime
+            server,
+            username,
+            password
         };
     }
 
-    /*
-     * Build the Playwright proxy configuration.
-     *
-     * One proxy is cached for each worker ID so repeated calls
-     * from the same worker don't constantly request a different
-     * ASocks proxy.
-     */
 
-    static async getProxyConfig(
-        sessionId
-    ) {
+    // ================================================================
+    // GET PROXY FOR WORKER
+    // ================================================================
 
-        const numericSessionId =
-            Number(
-                sessionId
+    static async getProxyConfig(sessionId) {
+        if (!this.API_KEY) {
+            console.log(
+                '[ProxyManager] ASOCKS_API_KEY not set - proxy disabled'
             );
 
-        /*
-         * Validate before checking the cache.
-         */
-
-        this.getRegion(
-            numericSessionId
-        );
-
-        if (
-            this.PROXY_CACHE.has(
-                numericSessionId
-            )
-        ) {
-
-            return this.PROXY_CACHE.get(
-                numericSessionId
-            );
+            return null;
         }
 
-        const proxy =
-            await this.requestProxy(
-                numericSessionId
+        const uniqueSessionId =
+            ++this.SESSION_COUNTER;
+
+        /*
+         * Start with one random region, then try the remaining
+         * configured regions if ASocks has no proxies available there.
+         */
+        const firstRegion =
+            this.getRandomRegion();
+
+        const remainingRegions =
+            this.shuffle(
+                this.REGIONS.filter(
+                    region => region !== firstRegion
+                )
             );
 
-        this.PROXY_CACHE.set(
-            numericSessionId,
-            proxy
+        const regionsToTry = [
+            firstRegion,
+            ...remainingRegions
+        ];
+
+        let lastError = null;
+
+        /*
+         * We don't need to try every country forever.
+         * Five different regions gives us sensible fallback behaviour.
+         */
+        const maxRegionAttempts = Math.min(
+            5,
+            regionsToTry.length
         );
 
-        return proxy;
-    }
+        for (
+            let attempt = 0;
+            attempt < maxRegionAttempts;
+            attempt++
+        ) {
+            const region =
+                regionsToTry[attempt];
 
-    /*
-     * Clear one cached worker proxy.
-     *
-     * This can be used later if we deliberately want
-     * to rotate a worker onto a fresh ASocks endpoint.
-     */
+            const country =
+                region.toUpperCase();
 
-    static clearProxy(
-        sessionId
-    ) {
+            try {
+                console.log(
+                    `[ProxyManager] Requesting ${country} proxy from ASocks API...`
+                );
 
-        const numericSessionId =
-            Number(
-                sessionId
-            );
+                const response =
+                    await this.requestJson(
+                        '/proxy/search',
+                        {
+                            country,
+                            limit: this.SEARCH_LIMIT
+                        }
+                    );
 
-        this.PROXY_CACHE.delete(
-            numericSessionId
+                const candidates =
+                    this.extractProxyCandidates(
+                        response
+                    );
+
+                if (candidates.length === 0) {
+                    console.log(
+                        `[ProxyManager] No ${country} proxies returned`
+                    );
+
+                    continue;
+                }
+
+                /*
+                 * Randomise which returned proxy gets used.
+                 */
+                const candidate =
+                    this.randomFrom(
+                        candidates
+                    );
+
+                const parsed =
+                    this.parseProxy(
+                        candidate
+                    );
+
+                if (!parsed) {
+                    console.log(
+                        `[ProxyManager] Invalid ${country} proxy returned`
+                    );
+
+                    continue;
+                }
+
+                /*
+                 * Do not print username/password into the console.
+                 */
+                console.log(
+                    `[ProxyManager] ${country} proxy selected: ${parsed.server}`
+                );
+
+                if (parsed.username) {
+                    console.log(
+                        `[ProxyManager] Proxy authentication: YES`
+                    );
+                } else {
+                    console.log(
+                        `[ProxyManager] Proxy authentication: NO`
+                    );
+                }
+
+                return {
+                    server: parsed.server,
+
+                    username: parsed.username,
+
+                    password: parsed.password,
+
+                    region,
+
+                    uniqueSessionId,
+
+                    workerSessionId: sessionId,
+
+                    expiresAt:
+                        Date.now() +
+                        (15 * 60 * 1000)
+                };
+
+            } catch (error) {
+                lastError = error;
+
+                console.log(
+                    `[ProxyManager] ${country} failed: ${error.message}`
+                );
+            }
+        }
+
+        /*
+         * If ASocks is enabled but no proxy can be obtained,
+         * throwing is preferable to silently sending traffic
+         * through the machine's real connection.
+         */
+        throw new Error(
+            `Unable to obtain ASocks proxy${
+                lastError
+                    ? `: ${lastError.message}`
+                    : ''
+            }`
         );
     }
 
-    /*
-     * Clear every cached proxy.
-     */
 
-    static clearAllProxies() {
+    // ================================================================
+    // OPTIONAL STRING FORMAT
+    // ================================================================
 
-        this.PROXY_CACHE.clear();
-    }
-
-    /*
-     * Optional compatibility/helper function.
-     *
-     * Because proxies are now obtained through the ASocks API,
-     * this method is asynchronous.
-     *
-     * Avoid logging the result because it contains the
-     * proxy username/password.
-     */
-
-    static async getProxyString(
-        sessionId
-    ) {
-
+    static async getProxyString(sessionId) {
         const proxy =
             await this.getProxyConfig(
                 sessionId
             );
 
-        const parsedServer =
-            new URL(
-                proxy.server
-            );
+        if (!proxy) {
+            return null;
+        }
 
-        return (
-            `${parsedServer.protocol}//` +
-            `${encodeURIComponent(proxy.username)}:` +
-            `${encodeURIComponent(proxy.password)}@` +
-            `${parsedServer.hostname}:` +
-            `${parsedServer.port}`
-        );
+        const parsed =
+            new URL(proxy.server);
+
+        if (proxy.username) {
+            parsed.username =
+                encodeURIComponent(
+                    proxy.username
+                );
+        }
+
+        if (proxy.password) {
+            parsed.password =
+                encodeURIComponent(
+                    proxy.password
+                );
+        }
+
+        return parsed
+            .toString()
+            .replace(/\/$/, '');
+    }
+
+
+    // ================================================================
+    // COMPATIBILITY METHODS
+    // ================================================================
+
+    static clearProxy(sessionId) {
+        /*
+         * ASocks search results do not require local cache cleanup.
+         * Kept for compatibility with older project code.
+         */
+    }
+
+
+    static clearAllProxies() {
+        /*
+         * Kept for compatibility with older project code.
+         */
     }
 }
+
 
 module.exports = ProxyManager;

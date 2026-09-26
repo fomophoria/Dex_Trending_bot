@@ -1,19 +1,19 @@
 {
-  "name": "dex-lab-project",
-  "version": "1.0.0",
-  "description": "",
+  "name": "dex-trending-bot",
+  "version": "2.0.0",
+  "description": "Enhanced DEX Screener automation with advanced anti-detection",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "playwright": "^1.63.0",
+    "playwright": "^1.44.0",
     "playwright-extra": "^4.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "crypto": "^1.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

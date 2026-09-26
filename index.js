@@ -1,544 +1,572 @@
 // index.js
+// Stable worker-pool manager.
+// Scheduled workers count toward the pool immediately,
+// preventing the previous over-spawn problem during staggered startup delays.
 
-const ResearchWorker = require('./research_worker');
-const config = require('./config');
-const ProxyManager = require('./proxy_manager');
+const ResearchWorker =
+  require('./research_worker');
+
+const config =
+  require('./config');
+
+const ProxyManager =
+  require('./proxy_manager');
+
 
 async function runSimulation() {
+  console.log('');
+  console.log('========================================');
+  console.log('   DEX SCREENER RESEARCH RUNNER         ');
+  console.log('========================================');
+  console.log('');
 
-    console.log('');
-    console.log('========================================');
-    console.log('       DEX BROWSER TEST STARTING        ');
-    console.log('========================================');
-    console.log('');
+  console.log(
+    `Target: ${config.TARGET_URL}`
+  );
 
-    console.log(`Target: ${config.TARGET_URL}`);
-    console.log(`Worker pool size: ${config.MAX_CONCURRENT_SESSIONS}`);
-    console.log(`Debug/browser visible: ${config.DEBUG_MODE}`);
-    console.log('');
+  console.log(
+    `Pool size: ${config.MAX_CONCURRENT_SESSIONS}`
+  );
 
-    /*
-     * Proxy provider pre-flight check.
-     *
-     * ResearchWorker now obtains its proxy directly from ProxyManager,
-     * so index.js no longer assigns proxies from config.PROXY_LIST.
-     */
+  console.log(
+    `Debug: ${config.DEBUG_MODE}`
+  );
 
-    console.log('[System] Checking ASocks proxy balance...');
+  console.log('');
 
-    let balance;
+
+  /*
+   * Proxy balance check
+   */
+
+  if (
+    config.PROXY_ENABLED
+  ) {
+    console.log(
+      '[System] Checking proxy balance...'
+    );
 
     try {
-        const balanceResult = await ProxyManager.getBalance();
+      const balance =
+        await ProxyManager.getBalance();
 
-        balance = Number.parseFloat(balanceResult);
+      console.log(
+        `[System] Balance: $${balance.toFixed(2)}`
+      );
 
-        if (!Number.isFinite(balance)) {
-            throw new Error(
-                `Invalid balance returned by ProxyManager: ${balanceResult}`
-            );
-        }
-
-        console.log(
-            `[System] Current ASocks Balance: $${balance.toFixed(2)}`
+      if (
+        balance < 1.0
+      ) {
+        console.error(
+          '[System] Insufficient proxy balance'
         );
+
+        process.exit(1);
+      }
 
     } catch (error) {
+      console.error(
+        '[System] Proxy check failed:',
+        error.message
+      );
 
-        console.error(
-            '[System] CRITICAL: Unable to retrieve ASocks balance:',
-            error.message || error
-        );
-
-        process.exit(1);
+      process.exit(1);
     }
+  }
 
-    if (balance < 1.00) {
 
-        console.error(
-            '[System] CRITICAL: Balance too low to sustain the configured worker pool.'
-        );
+  /*
+   * Pool limits
+   */
 
-        process.exit(1);
-    }
-
-    console.log(
-        '[System] Proxy pre-flight check passed.'
+  const POOL_SIZE =
+    Math.max(
+      1,
+      Number(
+        config.MAX_CONCURRENT_SESSIONS
+      ) || 1
     );
 
-    console.log('');
 
-    const WORKER_POOL_SIZE =
-        Math.max(
-            1,
-            Number(config.MAX_CONCURRENT_SESSIONS) || 1
-        );
+  const MIN_ACTIVE =
+    Math.max(
+      1,
 
-    const MIN_ACTIVE_SESSIONS =
-        Math.max(
-            1,
-            Math.min(
-                Number(config.MIN_ACTIVE_SESSIONS) || 3,
-                WORKER_POOL_SIZE
-            )
-        );
+      Math.min(
+        Number(
+          config.MIN_ACTIVE_SESSIONS
+        ) || 1,
 
-    const MAX_ACTIVE_SESSIONS =
-        Math.max(
-            MIN_ACTIVE_SESSIONS,
-            Math.min(
-                Number(config.MAX_ACTIVE_SESSIONS) || WORKER_POOL_SIZE,
-                WORKER_POOL_SIZE
-            )
-        );
-
-    const START_DELAY_RANGE =
-        Array.isArray(config.WORKER_START_DELAY_RANGE_MS)
-            ? config.WORKER_START_DELAY_RANGE_MS
-            : [2000, 12000];
-
-    const RESTART_DELAY_RANGE =
-        Array.isArray(config.WORKER_RESTART_DELAY_RANGE_MS)
-            ? config.WORKER_RESTART_DELAY_RANGE_MS
-            : [3000, 15000];
-
-    console.log(
-        `Active session range: ${MIN_ACTIVE_SESSIONS}-${MAX_ACTIVE_SESSIONS}`
+        POOL_SIZE
+      )
     );
 
-    console.log(
-        `Worker launch delay: ${START_DELAY_RANGE[0]}-${START_DELAY_RANGE[1]}ms`
+
+  const MAX_ACTIVE =
+    Math.max(
+      MIN_ACTIVE,
+
+      Math.min(
+        Number(
+          config.MAX_ACTIVE_SESSIONS
+        ) || POOL_SIZE,
+
+        POOL_SIZE
+      )
     );
 
-    console.log(
-        `Worker restart delay: ${RESTART_DELAY_RANGE[0]}-${RESTART_DELAY_RANGE[1]}ms`
+
+  const START_DELAY =
+    Array.isArray(
+      config.WORKER_START_DELAY_RANGE_MS
+    )
+      ? config.WORKER_START_DELAY_RANGE_MS
+      : [3000, 35000];
+
+
+  const RESTART_DELAY =
+    Array.isArray(
+      config.WORKER_RESTART_DELAY_RANGE_MS
+    )
+      ? config.WORKER_RESTART_DELAY_RANGE_MS
+      : [15000, 90000];
+
+
+  const targetSlots =
+    randomBetween(
+      MIN_ACTIVE,
+      MAX_ACTIVE
     );
 
-    console.log('');
-    console.log('========================================');
-    console.log('        RANDOM SCHEDULER STARTED        ');
-    console.log('========================================');
-    console.log('');
-
-    let nextWorkerId = 1;
-    let activeWorkers = 0;
-    let totalRuns = 0;
-    let shuttingDown = false;
-
-    /*
-     * Keep references to currently executing workers.
-     */
-    const runningWorkers = new Set();
-
-    /*
-     * Utility functions.
-     */
-
-    const sleep = ms => {
-        return new Promise(
-            resolve => setTimeout(resolve, ms)
-        );
-    };
-
-    const randomBetween = (min, max) => {
-
-        min = Math.floor(
-            Number(min)
-        );
-
-        max = Math.floor(
-            Number(max)
-        );
-
-        if (!Number.isFinite(min)) {
-            min = 0;
-        }
-
-        if (!Number.isFinite(max)) {
-            max = min;
-        }
-
-        if (max < min) {
-            [min, max] = [max, min];
-        }
-
-        return Math.floor(
-            Math.random() *
-            (max - min + 1)
-        ) + min;
-    };
-
-    /*
-     * Graceful shutdown.
-     *
-     * Ctrl+C prevents additional workers from being created.
-     * Existing workers are allowed to finish and close normally.
-     */
-
-    process.on(
-        'SIGINT',
-        () => {
-
-            if (shuttingDown) {
-                return;
-            }
-
-            shuttingDown = true;
-
-            console.log('');
-            console.log('========================================');
-            console.log('        SHUTDOWN REQUEST RECEIVED       ');
-            console.log('========================================');
-            console.log('');
-
-            console.log(
-                `[System] Waiting for ${activeWorkers} active worker(s) to finish...`
-            );
-        }
-    );
-
-    /*
-     * Launch one worker.
-     */
-
-    async function spawnWorker() {
-
-        if (shuttingDown) {
-            return;
-        }
-
-        /*
-         * Worker IDs rotate through the configured pool.
-         *
-         * Example with 30:
-         *
-         * 1,2,3 ... 29,30,1,2,3...
-         */
-
-        const workerId =
-            nextWorkerId;
-
-        nextWorkerId++;
-
-        if (
-            nextWorkerId >
-            WORKER_POOL_SIZE
-        ) {
-            nextWorkerId = 1;
-        }
-
-        activeWorkers++;
-        totalRuns++;
-
-        const runNumber =
-            totalRuns;
-
-        console.log('');
-
-        console.log(
-            `[System] Spawning Worker ${workerId} ` +
-            `(Run ${runNumber} | ${activeWorkers} active)`
-        );
-
-        /*
-         * ResearchWorker now obtains its proxy directly
-         * from ProxyManager using the worker/session ID.
-         *
-         * We therefore only pass workerId here.
-         */
-
-        const worker =
-            new ResearchWorker(
-                workerId
-            );
-
-        const workerPromise =
-            (async () => {
-
-                try {
-
-                    await worker.start();
-
-                } catch (error) {
-
-                    console.error(
-                        `[System] Worker ${workerId} failed:`,
-                        error
-                    );
-
-                } finally {
-
-                    activeWorkers--;
-
-                    console.log(
-                        `[System] Worker ${workerId} finished ` +
-                        `(Run ${runNumber} | ${activeWorkers} active)`
-                    );
-                }
-
-            })();
-
-        runningWorkers.add(
-            workerPromise
-        );
-
-        workerPromise.finally(
-            () => {
-                runningWorkers.delete(
-                    workerPromise
-                );
-            }
-        );
-    }
-
-    /*
-     * Initial ramp-up.
-     *
-     * Rather than immediately opening every browser,
-     * choose a random initial concurrency level
-     * and stagger each launch.
-     */
-
-    const initialTarget =
-        randomBetween(
-            MIN_ACTIVE_SESSIONS,
-            MAX_ACTIVE_SESSIONS
-        );
-
-    console.log(
-        `[System] Initial target: ${initialTarget} active worker(s)`
-    );
-
-    for (
-        let i = 0;
-        i < initialTarget;
-        i++
-    ) {
-
-        if (shuttingDown) {
-            break;
-        }
-
-        const delay =
-            randomBetween(
-                START_DELAY_RANGE[0],
-                START_DELAY_RANGE[1]
-            );
-
-        console.log(
-            `[System] Worker launch scheduled in ` +
-            `${(delay / 1000).toFixed(1)}s`
-        );
-
-        await sleep(
-            delay
-        );
-
-        if (shuttingDown) {
-            break;
-        }
-
-        spawnWorker();
-    }
-
-    /*
-     * Continuous scheduler.
-     *
-     * After the initial ramp-up:
-     *
-     *  - choose a new random desired concurrency
-     *  - compare it with currently active workers
-     *  - gradually start additional workers where necessary
-     *  - completed workers naturally reduce concurrency
-     *  - repeat indefinitely
-     */
-
-    while (!shuttingDown) {
-
-        const desiredWorkers =
-            randomBetween(
-                MIN_ACTIVE_SESSIONS,
-                MAX_ACTIVE_SESSIONS
-            );
-
-        console.log('');
-
-        console.log(
-            `[Scheduler] Active: ${activeWorkers} | ` +
-            `New random target: ${desiredWorkers}`
-        );
-
-        /*
-         * Only add workers when below the randomly selected target.
-         *
-         * If the target drops below the current active count,
-         * existing workers are NOT killed.
-         *
-         * They simply finish naturally.
-         */
-
-        if (
-            activeWorkers <
-            desiredWorkers
-        ) {
-
-            const requiredWorkers =
-                desiredWorkers -
-                activeWorkers;
-
-            console.log(
-                `[Scheduler] Need ${requiredWorkers} additional worker(s)`
-            );
-
-            for (
-                let i = 0;
-                i < requiredWorkers;
-                i++
-            ) {
-
-                if (shuttingDown) {
-                    break;
-                }
-
-                /*
-                 * Recalculate available capacity
-                 * before every spawn.
-                 */
-
-                if (
-                    activeWorkers >=
-                    MAX_ACTIVE_SESSIONS
-                ) {
-                    break;
-                }
-
-                const launchDelay =
-                    randomBetween(
-                        START_DELAY_RANGE[0],
-                        START_DELAY_RANGE[1]
-                    );
-
-                console.log(
-                    `[Scheduler] Next worker in ` +
-                    `${(launchDelay / 1000).toFixed(1)}s`
-                );
-
-                await sleep(
-                    launchDelay
-                );
-
-                if (shuttingDown) {
-                    break;
-                }
-
-                if (
-                    activeWorkers <
-                    MAX_ACTIVE_SESSIONS
-                ) {
-                    spawnWorker();
-                }
-            }
-
-        } else {
-
-            console.log(
-                '[Scheduler] No additional workers required.'
-            );
-        }
-
-        /*
-         * Random amount of time before concurrency
-         * is reconsidered.
-         */
-
-        const schedulerDelay =
-            randomBetween(
-                RESTART_DELAY_RANGE[0],
-                RESTART_DELAY_RANGE[1]
-            );
-
-        console.log(
-            `[Scheduler] Re-evaluating in ` +
-            `${(schedulerDelay / 1000).toFixed(1)}s`
-        );
-
-        await sleep(
-            schedulerDelay
-        );
-    }
-
-    /*
-     * Shutdown.
-     *
-     * Stop creating workers and allow anything
-     * already running to finish normally.
-     */
+
+  console.log(
+    `Active target: ${targetSlots}`
+  );
+
+  console.log(
+    `Start delay: ` +
+    `${START_DELAY[0]}-` +
+    `${START_DELAY[1]}ms`
+  );
+
+  console.log(
+    `Restart delay: ` +
+    `${RESTART_DELAY[0]}-` +
+    `${RESTART_DELAY[1]}ms`
+  );
+
+
+  console.log('');
+
+  console.log('========================================');
+  console.log('   POOL MANAGER STARTED                 ');
+  console.log('========================================');
+
+  console.log('');
+
+
+  /*
+   * Worker state
+   */
+
+  let shuttingDown =
+    false;
+
+  let totalRuns =
+    0;
+
+  let nextRunId =
+    1;
+
+
+  const slotPromises =
+    new Set();
+
+
+  const liveWorkers =
+    new Set();
+
+
+  function randomBetween(
+    min,
+    max
+  ) {
+    const low =
+      Math.ceil(
+        Number(min)
+      );
+
+    const high =
+      Math.floor(
+        Number(max)
+      );
+
 
     if (
-        runningWorkers.size >
-        0
+      !Number.isFinite(low) ||
+      !Number.isFinite(high)
     ) {
-
-        console.log('');
-
-        console.log(
-            `[System] Waiting for ${runningWorkers.size} worker(s)...`
-        );
-
-        await Promise.allSettled(
-            Array.from(
-                runningWorkers
-            )
-        );
+      throw new Error(
+        `Invalid random range: ${min}-${max}`
+      );
     }
 
-    console.log('');
-    console.log('========================================');
-    console.log('         ALL SESSIONS FINISHED          ');
-    console.log('========================================');
-    console.log('');
+
+    if (
+      high <= low
+    ) {
+      return low;
+    }
+
+
+    return Math.floor(
+      Math.random() *
+      (
+        high -
+        low +
+        1
+      )
+    ) + low;
+  }
+
+
+  const sleep =
+    ms =>
+      new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+
+            Math.max(
+              0,
+              Math.floor(ms)
+            )
+          )
+      );
+
+
+  /*
+   * Sleep that exits quickly when
+   * Ctrl+C / SIGTERM is received.
+   */
+
+  async function interruptibleSleep(
+    ms
+  ) {
+    const end =
+      Date.now() +
+      ms;
+
+
+    while (
+      !shuttingDown &&
+      Date.now() < end
+    ) {
+      await sleep(
+        Math.min(
+          250,
+          end -
+          Date.now()
+        )
+      );
+    }
+  }
+
+
+  /*
+   * Execute one worker instance.
+   */
+
+  async function runOneWorker(
+    slotId
+  ) {
+    const runId =
+      nextRunId++;
+
+
+    totalRuns++;
+
+
+    console.log(
+      `\n[System] === Slot ` +
+      `${slotId} / ` +
+      `Run #${runId} ===`
+    );
+
+
+    const worker =
+      new ResearchWorker(
+        runId
+      );
+
+
+    liveWorkers.add(
+      worker
+    );
+
+
+    try {
+      await worker.start();
+
+
+      console.log(
+        `[System] Run #${runId} completed`
+      );
+
+    } catch (error) {
+      console.error(
+        `[System] Run #${runId} error: ${error.message}`
+      );
+
+    } finally {
+      liveWorkers.delete(
+        worker
+      );
+    }
+  }
+
+
+  /*
+   * One permanent slot.
+   *
+   * Each slot:
+   * - starts after a staggered delay
+   * - runs one worker
+   * - waits for restart delay
+   * - runs another worker
+   *
+   * This avoids the old pool maintenance
+   * race condition entirely.
+   */
+
+  async function runSlot(
+    slotId
+  ) {
+    const firstDelay =
+      randomBetween(
+        START_DELAY[0],
+        START_DELAY[1]
+      );
+
+
+    console.log(
+      `[System] Slot ` +
+      `${slotId} ` +
+      `starting in ` +
+      `${firstDelay}ms`
+    );
+
+
+    await interruptibleSleep(
+      firstDelay
+    );
+
+
+    while (
+      !shuttingDown
+    ) {
+      await runOneWorker(
+        slotId
+      );
+
+
+      if (
+        shuttingDown
+      ) {
+        break;
+      }
+
+
+      const restartDelay =
+        randomBetween(
+          RESTART_DELAY[0],
+          RESTART_DELAY[1]
+        );
+
+
+      console.log(
+        `[System] Slot ` +
+        `${slotId} ` +
+        `restarting in ` +
+        `${restartDelay}ms`
+      );
+
+
+      await interruptibleSleep(
+        restartDelay
+      );
+    }
+  }
+
+
+  /*
+   * Shutdown handling
+   */
+
+  function beginShutdown(
+    signalName
+  ) {
+    if (
+      shuttingDown
+    ) {
+      return;
+    }
+
+
+    shuttingDown =
+      true;
+
+
+    console.log(
+      `\n[System] ${signalName} received...`
+    );
+  }
+
+
+  process.once(
+    'SIGINT',
+
+    () =>
+      beginShutdown(
+        'Shutdown signal'
+      )
+  );
+
+
+  process.once(
+    'SIGTERM',
+
+    () =>
+      beginShutdown(
+        'Termination signal'
+      )
+  );
+
+
+  /*
+   * Start fixed worker slots.
+   */
+
+  console.log(
+    `[System] Starting ` +
+    `${targetSlots} ` +
+    `worker slot(s)...`
+  );
+
+
+  for (
+    let slotId = 1;
+    slotId <= targetSlots;
+    slotId++
+  ) {
+    const promise =
+      runSlot(
+        slotId
+      );
+
+
+    slotPromises.add(
+      promise
+    );
+
+
+    promise.finally(
+      () =>
+        slotPromises.delete(
+          promise
+        )
+    );
+  }
+
+
+  /*
+   * Keep main process alive.
+   */
+
+  while (
+    !shuttingDown
+  ) {
+    await sleep(
+      250
+    );
+  }
+
+
+  /*
+   * Wait for all slot loops to stop.
+   */
+
+  if (
+    slotPromises.size > 0
+  ) {
+    console.log(
+      `[System] Waiting for ` +
+      `${slotPromises.size} ` +
+      `slot(s) to stop...`
+    );
+
+
+    await Promise.allSettled(
+      Array.from(
+        slotPromises
+      )
+    );
+  }
+
+
+  console.log('');
+
+  console.log('========================================');
+  console.log('   ALL SESSIONS COMPLETED               ');
+
+  console.log(
+    `   Total runs: ${totalRuns}`
+  );
+
+  console.log('========================================');
+
+  console.log('');
 }
 
+
 /*
- * Global error handling.
+ * Global error handlers
  */
 
 process.on(
-    'unhandledRejection',
-    error => {
+  'unhandledRejection',
 
-        console.error(
-            'Unhandled Promise Rejection:',
-            error
-        );
-    }
+  error => {
+    console.error(
+      'Unhandled rejection:',
+      error
+    );
+  }
 );
+
 
 process.on(
-    'uncaughtException',
-    error => {
+  'uncaughtException',
 
-        console.error(
-            'Uncaught Exception:',
-            error
-        );
+  error => {
+    console.error(
+      'Uncaught exception:',
+      error
+    );
 
-        process.exit(1);
-    }
+    process.exit(1);
+  }
 );
 
-/*
- * Start application.
- */
 
-runSimulation().catch(
+runSimulation()
+  .catch(
     error => {
+      console.error(
+        'Critical error:',
+        error
+      );
 
-        console.error(
-            'Critical Error:',
-            error
-        );
-
-        process.exit(1);
+      process.exit(1);
     }
-);
+  );
